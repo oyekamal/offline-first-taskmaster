@@ -15,11 +15,47 @@ interface TaskDetailProps {
 }
 
 export function TaskDetail({ taskId, onClose }: TaskDetailProps) {
-  const { task } = useTask(taskId);
+  const { task, isLoading: taskLoading } = useTask(taskId);
   const { updateTask, deleteTask, isLoading } = useTaskMutations();
   const [isEditing, setIsEditing] = useState(false);
+  const [error, setError] = useState<Error | null>(null);
 
-  if (!task) {
+  // Catch any rendering errors
+  if (error) {
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50 p-4">
+        <div className="bg-white rounded-lg p-8 max-w-md w-full">
+          <h3 className="text-lg font-bold text-red-600 mb-4">Error Loading Task</h3>
+          <p className="text-gray-700 mb-4">{error.message}</p>
+          <button
+            onClick={onClose}
+            className="w-full px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700"
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!task && !taskLoading) {
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50 p-4">
+        <div className="bg-white rounded-lg p-8 max-w-md w-full">
+          <h3 className="text-lg font-bold text-gray-900 mb-4">Task Not Found</h3>
+          <p className="text-gray-700 mb-4">The task you're looking for doesn't exist or has been deleted.</p>
+          <button
+            onClick={onClose}
+            className="w-full px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700"
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!task || taskLoading) {
     return (
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
         <div className="bg-white rounded-lg p-8">
@@ -30,17 +66,25 @@ export function TaskDetail({ taskId, onClose }: TaskDetailProps) {
   }
 
   const handleUpdate = async (data: UpdateTaskInput) => {
-    const result = await updateTask(taskId, data);
-    if (result) {
-      setIsEditing(false);
+    try {
+      const result = await updateTask(taskId, data);
+      if (result) {
+        setIsEditing(false);
+      }
+    } catch (err) {
+      setError(err as Error);
     }
   };
 
   const handleDelete = async () => {
     if (confirm('Are you sure you want to delete this task?')) {
-      const result = await deleteTask(taskId);
-      if (result) {
-        onClose();
+      try {
+        const result = await deleteTask(taskId);
+        if (result) {
+          onClose();
+        }
+      } catch (err) {
+        setError(err as Error);
       }
     }
   };
@@ -162,7 +206,7 @@ export function TaskDetail({ taskId, onClose }: TaskDetailProps) {
                   </div>
                   <div>
                     <span className="text-gray-500">Position:</span>
-                    <span className="ml-2 text-gray-900">{task.position.toFixed(2)}</span>
+                    <span className="ml-2 text-gray-900">{Number(task.position).toFixed(2)}</span>
                   </div>
                 </div>
               </div>

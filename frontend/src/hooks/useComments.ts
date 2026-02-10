@@ -56,17 +56,29 @@ export function useCommentMutations() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
 
-  // Default user info (in a real app, get from auth context)
-  const currentUser = {
-    id: localStorage.getItem('user_id') || 'local-user',
-    name: localStorage.getItem('user_name') || 'Local User',
-    avatar_url: localStorage.getItem('user_avatar') || undefined
+  // Get user info from localStorage with fallbacks
+  const getUserInfo = () => {
+    try {
+      return {
+        id: localStorage.getItem('user_id') || 'local-user',
+        name: localStorage.getItem('user_name') || 'Local User',
+        avatar_url: localStorage.getItem('user_avatar') || undefined
+      };
+    } catch (err) {
+      console.error('Failed to get user info from localStorage:', err);
+      return {
+        id: 'local-user',
+        name: 'Local User',
+        avatar_url: undefined
+      };
+    }
   };
 
   const createComment = async (input: CreateCommentInput): Promise<Comment | null> => {
     setIsLoading(true);
     setError(null);
     try {
+      const currentUser = getUserInfo();
       const comment = await commentRepository.create(input, currentUser);
       toast.success('Comment added successfully');
       return comment;
@@ -74,6 +86,7 @@ export function useCommentMutations() {
       const error = err as Error;
       setError(error);
       toast.error(`Failed to add comment: ${error.message}`);
+      console.error('Create comment error:', error);
       return null;
     } finally {
       setIsLoading(false);

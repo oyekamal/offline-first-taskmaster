@@ -52,9 +52,11 @@ export function useTask(id: string | null) {
     [id]
   );
 
+  const isLoading = task === undefined && id !== null;
+
   return {
-    task: task || null,
-    isLoading: task === undefined && id !== null
+    task: task === undefined ? null : task,
+    isLoading
   };
 }
 

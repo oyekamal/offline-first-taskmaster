@@ -389,6 +389,16 @@ class ApiClient {
       setServerDeviceId(device.id);
     }
 
+    // Save user info to localStorage for offline access
+    if (user) {
+      localStorage.setItem('user_id', user.id);
+      localStorage.setItem('user_name', user.name);
+      localStorage.setItem('user_email', user.email);
+      if (user.avatar_url) {
+        localStorage.setItem('user_avatar', user.avatar_url);
+      }
+    }
+
     return { user, device };
   }
 
@@ -398,6 +408,11 @@ class ApiClient {
   logout() {
     this.clearTokens();
     clearDeviceIds();
+    // Clear user info
+    localStorage.removeItem('user_id');
+    localStorage.removeItem('user_name');
+    localStorage.removeItem('user_email');
+    localStorage.removeItem('user_avatar');
   }
 
   /**
