@@ -1,0 +1,50 @@
+.
+|-- FEATURES.md
+|-- index.html
+|-- package.json
+|-- postcss.config.js
+|-- PROJECT_STRUCTURE.txt
+|-- public
+|   |-- manifest.json
+|   `-- sw.js
+|-- README.md
+|-- SETUP.md
+|-- src
+|   |-- App.tsx
+|   |-- components
+|   |   |-- CommentSection.tsx
+|   |   |-- ConflictResolver.tsx
+|   |   |-- OfflineIndicator.tsx
+|   |   |-- SyncStatusIndicator.tsx
+|   |   |-- TaskCard.tsx
+|   |   |-- TaskDetail.tsx
+|   |   |-- TaskFilters.tsx
+|   |   |-- TaskForm.tsx
+|   |   |-- TaskListDraggable.tsx
+|   |   `-- TaskListVirtualized.tsx
+|   |-- db
+|   |   |-- index.ts
+|   |   `-- repositories
+|   |-- hooks
+|   |   |-- index.ts
+|   |   |-- useComments.ts
+|   |   |-- useOnlineStatus.ts
+|   |   |-- useSync.ts
+|   |   `-- useTasks.ts
+|   |-- index.css
+|   |-- main.tsx
+|   |-- services
+|   |   |-- apiClient.ts
+|   |   `-- syncManager.ts
+|   |-- types
+|   |   `-- index.ts
+|   `-- utils
+|       |-- dateFormat.ts
+|       `-- fractionalIndexing.ts
+|-- tailwind.config.js
+|-- tsconfig.json
+|-- tsconfig.node.json
+|-- verify-structure.sh
+`-- vite.config.ts
+
+10 directories, 38 files
