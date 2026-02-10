@@ -7,7 +7,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django.db import transaction
 from django.utils import timezone
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone as dt_timezone
 import logging
 import time
 
@@ -475,7 +475,7 @@ def sync_pull(request):
     )
 
     try:
-        since_datetime = datetime.fromtimestamp(since_timestamp / 1000, tz=timezone.utc)
+        since_datetime = datetime.fromtimestamp(since_timestamp / 1000, tz=dt_timezone.utc)
 
         # Fetch tasks
         tasks = Task.all_objects.filter(
@@ -637,7 +637,7 @@ def _parse_timestamp(timestamp_value):
     if timestamp_value is None:
         return None
     if isinstance(timestamp_value, (int, float)):
-        return datetime.fromtimestamp(timestamp_value / 1000, tz=timezone.utc)
+        return datetime.fromtimestamp(timestamp_value / 1000, tz=dt_timezone.utc)
     if isinstance(timestamp_value, str):
         return datetime.fromisoformat(timestamp_value.replace('Z', '+00:00'))
     return timestamp_value

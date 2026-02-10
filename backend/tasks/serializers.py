@@ -35,7 +35,8 @@ class TaskSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = [
             'id', 'organization', 'created_by', 'checksum',
-            'created_at', 'updated_at', 'deleted_at'
+            'created_at', 'updated_at', 'deleted_at',
+            'last_modified_by', 'last_modified_device', 'vector_clock',
         ]
 
     def get_comment_count(self, obj):
@@ -139,7 +140,8 @@ class CommentSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = [
             'id', 'user', 'is_edited',
-            'created_at', 'updated_at', 'deleted_at'
+            'created_at', 'updated_at', 'deleted_at',
+            'last_modified_by', 'last_modified_device', 'vector_clock',
         ]
 
     def create(self, validated_data):

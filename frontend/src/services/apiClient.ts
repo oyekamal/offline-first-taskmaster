@@ -10,7 +10,7 @@
  */
 
 import axios, { AxiosInstance, AxiosError, InternalAxiosRequestConfig } from 'axios';
-import { getDeviceId } from '../db';
+import { getDeviceId, getDeviceFingerprint, setServerDeviceId, clearDeviceIds } from '../db';
 import {
   Task,
   Comment,
@@ -75,9 +75,8 @@ class ApiClient {
             await this.refreshAccessToken();
             return this.client(originalRequest);
           } catch (refreshError) {
-            // Refresh failed, logout user
+            // Refresh failed, clear tokens (React auth state will show login page)
             this.clearTokens();
-            window.location.href = '/login';
             return Promise.reject(refreshError);
           }
         }
@@ -236,10 +235,10 @@ class ApiClient {
    * Get comments for a task
    */
   async getComments(taskId: string): Promise<Comment[]> {
-    const response = await this.client.get<Comment[]>('/api/comments/', {
+    const response = await this.client.get<PaginatedResponse<Comment>>('/api/comments/', {
       params: { task: taskId }
     });
-    return response.data;
+    return response.data.results;
   }
 
   /**
@@ -274,11 +273,78 @@ class ApiClient {
   }
 
   // ============================================================
-  // BATCH SYNC ENDPOINTS
+  // PROPER SYNC PUSH/PULL ENDPOINTS
   // ============================================================
 
   /**
-   * Sync multiple tasks in batch
+   * Push changes to server using batch sync endpoint
+   */
+  async syncPush(data: {
+    deviceId: string;
+    vectorClock: Record<string, number>;
+    timestamp: number;
+    changes: {
+      tasks?: Array<{
+        id: string;
+        operation: 'create' | 'update' | 'delete';
+        data: any;
+      }>;
+      comments?: Array<{
+        id: string;
+        operation: 'create' | 'update' | 'delete';
+        data: any;
+      }>;
+    };
+  }): Promise<{
+    success: boolean;
+    processed: number;
+    conflicts: Array<{
+      entityType: string;
+      entityId: string;
+      conflictReason: string;
+      serverVersion: any;
+      serverVectorClock: Record<string, number>;
+    }>;
+    serverVectorClock: Record<string, number>;
+    timestamp: number;
+  }> {
+    const response = await this.client.post('/api/sync/push/', data);
+    return response.data;
+  }
+
+  /**
+   * Pull changes from server using batch sync endpoint
+   */
+  async syncPull(params: {
+    since: number;  // Unix timestamp in milliseconds
+    limit?: number; // Max entities per type (default: 100)
+  }): Promise<{
+    tasks: Task[];
+    comments: Comment[];
+    tombstones: Array<{
+      id: string;
+      entity_type: string;
+      entity_id: string;
+      deleted_by: string;
+      deleted_from_device: string | null;
+      vector_clock: Record<string, number>;
+      created_at: number;
+      expires_at: number;
+    }>;
+    serverVectorClock: Record<string, number>;
+    hasMore: boolean;
+    timestamp: number;
+  }> {
+    const response = await this.client.get('/api/sync/pull/', { params });
+    return response.data;
+  }
+
+  // ============================================================
+  // LEGACY INDIVIDUAL ENDPOINTS (kept for backwards compatibility)
+  // ============================================================
+
+  /**
+   * Sync multiple tasks in batch (DEPRECATED - use syncPush instead)
    */
   async batchSyncTasks(tasks: Task[]): Promise<Task[]> {
     const response = await this.client.post<Task[]>('/api/tasks/batch_sync/', { tasks });
@@ -286,13 +352,13 @@ class ApiClient {
   }
 
   /**
-   * Get tasks updated since timestamp
+   * Get tasks updated since timestamp (DEPRECATED - use syncPull instead)
    */
   async getTasksSince(timestamp: string): Promise<Task[]> {
-    const response = await this.client.get<Task[]>('/api/tasks/', {
+    const response = await this.client.get<PaginatedResponse<Task>>('/api/tasks/', {
       params: { updated_since: timestamp }
     });
-    return response.data;
+    return response.data.results;
   }
 
   // ============================================================
@@ -306,16 +372,22 @@ class ApiClient {
     user: any;
     device: any;
   }> {
-    const deviceId = getDeviceId();
+    // Use device fingerprint for login (not the ID)
+    const fingerprint = getDeviceFingerprint();
     const response = await this.client.post('/api/auth/login/', {
       email,
       password,
-      deviceFingerprint: deviceId,
+      deviceFingerprint: fingerprint,
       deviceName: navigator.userAgent.substring(0, 50)
     });
 
     const { access, refresh, user, device } = response.data;
     this.setTokens(access, refresh);
+    
+    // Save server device ID for future requests
+    if (device && device.id) {
+      setServerDeviceId(device.id);
+    }
 
     return { user, device };
   }
@@ -325,6 +397,7 @@ class ApiClient {
    */
   logout() {
     this.clearTokens();
+    clearDeviceIds();
   }
 
   /**

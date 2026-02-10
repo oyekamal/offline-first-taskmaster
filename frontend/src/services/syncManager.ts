@@ -56,9 +56,13 @@ export class SyncManager {
     }
 
     // Register background sync if supported
-    if ('serviceWorker' in navigator && 'sync' in (self as any).registration) {
+    if ('serviceWorker' in navigator) {
       navigator.serviceWorker.ready.then(registration => {
-        (registration as any).sync.register('sync-tasks');
+        if ('sync' in registration) {
+          (registration as any).sync.register('sync-tasks');
+        }
+      }).catch(err => {
+        console.warn('Background sync registration failed:', err);
       });
     }
   }
@@ -160,35 +164,56 @@ export class SyncManager {
   }
 
   /**
-   * Pull changes from server
+   * Pull changes from server using proper batch sync endpoint
    */
   private async pullFromServer(): Promise<void> {
     try {
       // Get last sync timestamp
       const deviceInfo = await db.device_info.get(getDeviceId());
-      const lastSync = deviceInfo?.last_sync_at;
+      const lastSyncAt = deviceInfo?.last_sync_at;
+      
+      // Convert ISO string to Unix timestamp in milliseconds
+      const sinceTimestamp = lastSyncAt 
+        ? new Date(lastSyncAt).getTime()
+        : Date.now() - (30 * 24 * 60 * 60 * 1000); // Default: 30 days ago
 
-      // Fetch tasks updated since last sync
-      const tasks = lastSync
-        ? await apiClient.getTasksSince(lastSync)
-        : (await apiClient.getTasks()).results;
+      // Call proper sync pull endpoint
+      const pullResponse = await apiClient.syncPull({
+        since: sinceTimestamp,
+        limit: 100
+      });
 
-      // Sync each task to local database
-      for (const task of tasks) {
+      console.log(`Pulled ${pullResponse.tasks.length} tasks, ${pullResponse.comments.length} comments, ${pullResponse.tombstones.length} tombstones from server`);
+
+      // Process tasks
+      for (const task of pullResponse.tasks) {
         await taskRepository.syncFromServer(task);
+      }
 
-        // Fetch comments for this task
-        try {
-          const comments = await apiClient.getComments(task.id);
-          for (const comment of comments) {
-            await commentRepository.syncFromServer(comment);
-          }
-        } catch (error) {
-          console.error(`Failed to sync comments for task ${task.id}:`, error);
+      // Process comments
+      for (const comment of pullResponse.comments) {
+        await commentRepository.syncFromServer(comment);
+      }
+
+      // Process tombstones (deletions)
+      for (const tombstone of pullResponse.tombstones) {
+        if (tombstone.entity_type === 'task') {
+          await db.tasks.where('id').equals(tombstone.entity_id).delete();
+        } else if (tombstone.entity_type === 'comment') {
+          await db.comments.where('id').equals(tombstone.entity_id).delete();
         }
       }
 
-      console.log(`Pulled ${tasks.length} tasks from server`);
+      // Update device vector clock with server's vector clock
+      await db.device_info.update(getDeviceId(), {
+        vector_clock: pullResponse.serverVectorClock
+      });
+
+      // If there are more changes, pull again
+      if (pullResponse.hasMore) {
+        console.log('More changes available, pulling again...');
+        await this.pullFromServer();
+      }
     } catch (error) {
       console.error('Error pulling from server:', error);
       throw error;
@@ -196,194 +221,145 @@ export class SyncManager {
   }
 
   /**
-   * Push local changes to server
+   * Push local changes to server using proper batch sync endpoint
    */
   private async pushToServer(): Promise<void> {
     const maxRetries = 3;
-    const queue = await db.sync_queue.orderBy('created_at').toArray();
+    const queue = await db.sync_queue
+      .filter(entry => entry.attempt_count < maxRetries)
+      .sortBy('created_at');
+
+    if (queue.length === 0) {
+      console.log('No pending changes to push');
+      return;
+    }
 
     console.log(`Processing ${queue.length} queued operations`);
 
+    // Get device info
+    const deviceId = getDeviceId();
+    const deviceInfo = await db.device_info.get(deviceId);
+    const vectorClock = deviceInfo?.vector_clock || {};
+
+    // Group changes by entity type
+    const taskChanges: Array<{ id: string; operation: 'create' | 'update' | 'delete'; data: any }> = [];
+    const commentChanges: Array<{ id: string; operation: 'create' | 'update' | 'delete'; data: any }> = [];
+
+    // Prepare changes in batch format
     for (const entry of queue) {
-      // Skip if too many retries
-      if (entry.attempt_count >= maxRetries) {
-        console.error(`Max retries exceeded for ${entry.entity_type} ${entry.entity_id}`);
-        continue;
+      const changeItem = {
+        id: entry.entity_id,
+        operation: entry.operation.toLowerCase() as 'create' | 'update' | 'delete',
+        data: entry.data || await this.getEntityData(entry.entity_type, entry.entity_id)
+      };
+
+      if (entry.entity_type === 'task') {
+        taskChanges.push(changeItem);
+      } else if (entry.entity_type === 'comment') {
+        commentChanges.push(changeItem);
+      }
+    }
+
+    // Prepare batch push payload
+    const pushPayload = {
+      deviceId,
+      vectorClock,
+      timestamp: Date.now(),
+      changes: {
+        ...(taskChanges.length > 0 && { tasks: taskChanges }),
+        ...(commentChanges.length > 0 && { comments: commentChanges })
+      }
+    };
+
+    try {
+      // Call proper sync push endpoint
+      const pushResponse = await apiClient.syncPush(pushPayload);
+
+      console.log(`Pushed ${pushResponse.processed} items, ${pushResponse.conflicts.length} conflicts`);
+
+      // Handle conflicts
+      for (const conflict of pushResponse.conflicts) {
+        await this.handleServerConflict(conflict);
       }
 
-      try {
-        await this.processSyncQueueEntry(entry);
-        // Remove from queue on success
-        await db.sync_queue.delete(entry.id);
-      } catch (error: any) {
-        // Update attempt count and error message
+      // Update device vector clock with server's vector clock
+      await db.device_info.update(deviceId, {
+        vector_clock: pushResponse.serverVectorClock
+      });
+
+      // Remove successfully processed items from queue
+      const processedIds = queue.slice(0, pushResponse.processed).map(e => e.id);
+      await db.sync_queue.bulkDelete(processedIds);
+
+    } catch (error: any) {
+      console.error('Batch push failed:', error);
+      
+      // Update attempt count for all entries
+      for (const entry of queue) {
         await db.sync_queue.update(entry.id, {
           attempt_count: entry.attempt_count + 1,
           last_attempt_at: new Date().toISOString(),
           error_message: error.message || 'Unknown error'
         });
-        console.error(`Failed to sync ${entry.entity_type} ${entry.entity_id}:`, error);
       }
+      throw error;
     }
   }
 
   /**
-   * Process a single sync queue entry
+   * Get entity data for sync
    */
-  private async processSyncQueueEntry(entry: SyncQueueEntry): Promise<void> {
-    if (entry.entity_type === 'task') {
-      await this.syncTask(entry);
-    } else if (entry.entity_type === 'comment') {
-      await this.syncComment(entry);
+  private async getEntityData(entityType: string, entityId: string): Promise<any> {
+    if (entityType === 'task') {
+      return await db.tasks.get(entityId);
+    } else if (entityType === 'comment') {
+      return await db.comments.get(entityId);
     }
+    return null;
   }
 
   /**
-   * Sync a task to server
+   * Handle conflict returned from server
    */
-  private async syncTask(entry: SyncQueueEntry): Promise<void> {
-    const localTask = await db.tasks.get(entry.entity_id);
-    if (!localTask) {
-      console.warn(`Task ${entry.entity_id} not found locally`);
-      return;
+  private async handleServerConflict(conflict: {
+    entityType: string;
+    entityId: string;
+    conflictReason: string;
+    serverVersion: any;
+    serverVectorClock: Record<string, number>;
+  }): Promise<void> {
+    console.log(`Conflict detected for ${conflict.entityType} ${conflict.entityId}: ${conflict.conflictReason}`);
+
+    // Mark entity as conflicted in local database
+    if (conflict.entityType === 'task') {
+      await db.tasks.update(conflict.entityId, {
+        _conflict: true,
+        _sync_status: 'conflict'
+      });
+    } else if (conflict.entityType === 'comment') {
+      await db.comments.update(conflict.entityId, {
+        _conflict: true,
+        _sync_status: 'conflict'
+      });
     }
 
-    let serverTask: Task;
+    // Get local version
+    const localVersion = conflict.entityType === 'task'
+      ? await db.tasks.get(conflict.entityId)
+      : await db.comments.get(conflict.entityId);
 
-    try {
-      if (entry.operation === 'CREATE') {
-        // Create on server
-        serverTask = await apiClient.createTask({
-          title: localTask.title,
-          description: localTask.description,
-          status: localTask.status,
-          priority: localTask.priority,
-          due_date: localTask.due_date,
-          assigned_to: localTask.assigned_to,
-          tags: localTask.tags,
-          custom_fields: localTask.custom_fields
-        });
-      } else if (entry.operation === 'UPDATE') {
-        // Update on server
-        serverTask = await apiClient.updateTask(entry.entity_id, entry.data as any);
-      } else if (entry.operation === 'DELETE') {
-        // Delete on server
-        await apiClient.deleteTask(entry.entity_id);
-        return;
-      } else {
-        throw new Error(`Unknown operation: ${entry.operation}`);
-      }
-
-      // Check for conflicts
-      const hasConflict = this.detectVectorClockConflict(
-        localTask.vector_clock,
-        serverTask.vector_clock
-      );
-
-      if (hasConflict) {
-        // Mark as conflict for user resolution
-        await db.tasks.update(entry.entity_id, {
-          _conflict: true,
-          _sync_status: 'conflict'
-        });
-
-        // Notify conflict callbacks
-        this.notifyConflict({
-          conflict_id: entry.entity_id,
-          entity_type: 'task',
-          entity_id: entry.entity_id,
-          local_version: localTask,
-          server_version: serverTask,
-          resolution: 'use_local'
-        });
-      } else {
-        // Update local with server data
-        await db.tasks.put({
-          ...serverTask,
-          _local_only: false,
-          _sync_status: 'synced',
-          _conflict: false
-        });
-      }
-    } catch (error: any) {
-      // Handle specific errors
-      if (error.status === 404) {
-        // Task deleted on server, mark as deleted locally
-        await db.tasks.update(entry.entity_id, {
-          deleted_at: new Date().toISOString()
-        });
-      } else {
-        throw error;
-      }
-    }
+    // Notify conflict callbacks
+    this.notifyConflict({
+      conflict_id: conflict.entityId,
+      entity_type: conflict.entityType,
+      entity_id: conflict.entityId,
+      local_version: localVersion,
+      server_version: conflict.serverVersion,
+      resolution: 'use_local'
+    });
   }
 
-  /**
-   * Sync a comment to server
-   */
-  private async syncComment(entry: SyncQueueEntry): Promise<void> {
-    const localComment = await db.comments.get(entry.entity_id);
-    if (!localComment) {
-      console.warn(`Comment ${entry.entity_id} not found locally`);
-      return;
-    }
 
-    let serverComment: Comment;
-
-    try {
-      if (entry.operation === 'CREATE') {
-        serverComment = await apiClient.createComment({
-          task: localComment.task,
-          content: localComment.content,
-          parent: localComment.parent
-        });
-      } else if (entry.operation === 'UPDATE') {
-        serverComment = await apiClient.updateComment(entry.entity_id, entry.data as any);
-      } else if (entry.operation === 'DELETE') {
-        await apiClient.deleteComment(entry.entity_id);
-        return;
-      } else {
-        throw new Error(`Unknown operation: ${entry.operation}`);
-      }
-
-      // Check for conflicts
-      const hasConflict = this.detectVectorClockConflict(
-        localComment.vector_clock,
-        serverComment.vector_clock
-      );
-
-      if (hasConflict) {
-        await db.comments.update(entry.entity_id, {
-          _conflict: true,
-          _sync_status: 'conflict'
-        });
-
-        this.notifyConflict({
-          conflict_id: entry.entity_id,
-          entity_type: 'comment',
-          entity_id: entry.entity_id,
-          local_version: localComment,
-          server_version: serverComment,
-          resolution: 'use_local'
-        });
-      } else {
-        await db.comments.put({
-          ...serverComment,
-          _local_only: false,
-          _sync_status: 'synced',
-          _conflict: false
-        });
-      }
-    } catch (error: any) {
-      if (error.status === 404) {
-        await db.comments.update(entry.entity_id, {
-          deleted_at: new Date().toISOString()
-        });
-      } else {
-        throw error;
-      }
-    }
-  }
 
   /**
    * Resolve a conflict

@@ -111,15 +111,46 @@ export const db = new TaskManagerDB();
 
 /**
  * Get or create a unique device ID for this client
+ * Returns server device ID if authenticated, otherwise device fingerprint
  * Stored in localStorage for persistence across sessions
  */
 export function getDeviceId(): string {
-  let deviceId = localStorage.getItem('device_id');
-  if (!deviceId) {
-    deviceId = uuidv4();
-    localStorage.setItem('device_id', deviceId);
+  // First check for server device ID (set after login)
+  const serverDeviceId = localStorage.getItem('server_device_id');
+  if (serverDeviceId) {
+    return serverDeviceId;
   }
-  return deviceId;
+  
+  // Fall back to device fingerprint (used for login)
+  return getDeviceFingerprint();
+}
+
+/**
+ * Get device fingerprint for login/registration
+ * This is sent to server and server returns actual device ID
+ */
+export function getDeviceFingerprint(): string {
+  let deviceFingerprint = localStorage.getItem('device_fingerprint');
+  if (!deviceFingerprint) {
+    deviceFingerprint = uuidv4();
+    localStorage.setItem('device_fingerprint', deviceFingerprint);
+  }
+  return deviceFingerprint;
+}
+
+/**
+ * Save server device ID after login
+ */
+export function setServerDeviceId(deviceId: string): void {
+  localStorage.setItem('server_device_id', deviceId);
+}
+
+/**
+ * Clear device IDs (used on logout)
+ */
+export function clearDeviceIds(): void {
+  localStorage.removeItem('server_device_id');
+  // Keep device_fingerprint for next login
 }
 
 /**
