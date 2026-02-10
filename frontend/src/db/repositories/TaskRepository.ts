@@ -271,6 +271,7 @@ export class TaskRepository {
       await db.tasks.add({
         ...task,
         _local_only: false,
+        _conflict: false,
         _sync_status: 'synced'
       });
     } else {
@@ -284,10 +285,11 @@ export class TaskRepository {
           _sync_status: 'conflict'
         });
       } else {
-        // Server version is newer, accept it
+        // Server version is newer, accept it and clear any conflict flags
         await db.tasks.put({
           ...task,
           _local_only: false,
+          _conflict: false,
           _sync_status: 'synced'
         });
       }

@@ -11,6 +11,7 @@
 import { useEffect, useState } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { taskRepository } from '../db/repositories/TaskRepository';
+import { syncManager } from '../services/syncManager';
 import {
   Task,
   TaskFilters,
@@ -73,6 +74,8 @@ export function useTaskMutations() {
     try {
       const task = await taskRepository.create(input);
       toast.success('Task created successfully');
+      // Trigger debounced sync (waits 2 seconds before syncing)
+      syncManager.debouncedSync();
       return task;
     } catch (err) {
       const error = err as Error;
@@ -90,6 +93,8 @@ export function useTaskMutations() {
     try {
       const task = await taskRepository.update(id, updates);
       toast.success('Task updated successfully');
+      // Trigger debounced sync (waits 2 seconds before syncing)
+      syncManager.debouncedSync();
       return task;
     } catch (err) {
       const error = err as Error;
@@ -107,6 +112,8 @@ export function useTaskMutations() {
     try {
       await taskRepository.delete(id);
       toast.success('Task deleted successfully');
+      // Trigger debounced sync (waits 2 seconds before syncing)
+      syncManager.debouncedSync();
       return true;
     } catch (err) {
       const error = err as Error;
@@ -121,6 +128,8 @@ export function useTaskMutations() {
   const updatePosition = async (id: string, newPosition: number): Promise<boolean> => {
     try {
       await taskRepository.updatePosition(id, newPosition);
+      // Trigger debounced sync (waits 2 seconds before syncing)
+      syncManager.debouncedSync();
       return true;
     } catch (err) {
       const error = err as Error;
@@ -136,6 +145,8 @@ export function useTaskMutations() {
     try {
       await taskRepository.bulkUpdate(ids, updates);
       toast.success(`${ids.length} tasks updated successfully`);
+      // Trigger debounced sync (waits 2 seconds before syncing)
+      syncManager.debouncedSync();
       return true;
     } catch (err) {
       const error = err as Error;

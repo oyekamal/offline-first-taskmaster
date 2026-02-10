@@ -10,6 +10,7 @@
 import { useState } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { commentRepository } from '../db/repositories/CommentRepository';
+import { syncManager } from '../services/syncManager';
 import {
   Comment,
   CreateCommentInput,
@@ -81,6 +82,8 @@ export function useCommentMutations() {
       const currentUser = getUserInfo();
       const comment = await commentRepository.create(input, currentUser);
       toast.success('Comment added successfully');
+      // Trigger debounced sync (waits 2 seconds before syncing)
+      syncManager.debouncedSync();
       return comment;
     } catch (err) {
       const error = err as Error;
@@ -99,6 +102,8 @@ export function useCommentMutations() {
     try {
       const comment = await commentRepository.update(id, updates);
       toast.success('Comment updated successfully');
+      // Trigger debounced sync (waits 2 seconds before syncing)
+      syncManager.debouncedSync();
       return comment;
     } catch (err) {
       const error = err as Error;
@@ -116,6 +121,8 @@ export function useCommentMutations() {
     try {
       await commentRepository.delete(id);
       toast.success('Comment deleted successfully');
+      // Trigger debounced sync (waits 2 seconds before syncing)
+      syncManager.debouncedSync();
       return true;
     } catch (err) {
       const error = err as Error;

@@ -25,6 +25,7 @@ import {
 export class SyncManager {
   private isSyncing = false;
   private syncInterval: number | null = null;
+  private debounceTimer: number | null = null;
   private onlineStatusListener: (() => void) | null = null;
   private statusCallbacks: Set<(status: SyncStatusInfo) => void> = new Set();
   private conflictCallbacks: Set<(conflicts: ConflictResolution[]) => void> = new Set();
@@ -74,6 +75,9 @@ export class SyncManager {
     if (this.syncInterval) {
       clearInterval(this.syncInterval);
     }
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+    }
     if (this.onlineStatusListener) {
       window.removeEventListener('online', this.onlineStatusListener);
     }
@@ -120,7 +124,24 @@ export class SyncManager {
   }
 
   /**
-   * Manual sync trigger
+   * Debounced sync trigger - delays sync by 2 seconds
+   * Useful for batching rapid changes without immediate API calls
+   */
+  debouncedSync(): void {
+    // Clear existing timer
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+    }
+
+    // Set new timer for 2 second delay
+    this.debounceTimer = window.setTimeout(() => {
+      this.sync();
+      this.debounceTimer = null;
+    }, 2000);
+  }
+
+  /**
+   * Manual sync trigger - immediate sync
    */
   async sync(): Promise<void> {
     if (this.isSyncing) {
@@ -188,19 +209,25 @@ export class SyncManager {
       // Process tasks
       for (const task of pullResponse.tasks) {
         await taskRepository.syncFromServer(task);
+        // Remove from sync queue if exists (server is source of truth)
+        await db.sync_queue.where('entity_id').equals(task.id).delete();
       }
 
       // Process comments
       for (const comment of pullResponse.comments) {
         await commentRepository.syncFromServer(comment);
+        // Remove from sync queue if exists (server is source of truth)
+        await db.sync_queue.where('entity_id').equals(comment.id).delete();
       }
 
       // Process tombstones (deletions)
       for (const tombstone of pullResponse.tombstones) {
         if (tombstone.entity_type === 'task') {
           await db.tasks.where('id').equals(tombstone.entity_id).delete();
+          await db.sync_queue.where('entity_id').equals(tombstone.entity_id).delete();
         } else if (tombstone.entity_type === 'comment') {
           await db.comments.where('id').equals(tombstone.entity_id).delete();
+          await db.sync_queue.where('entity_id').equals(tombstone.entity_id).delete();
         }
       }
 
@@ -235,6 +262,15 @@ export class SyncManager {
     }
 
     console.log(`Processing ${queue.length} queued operations`);
+
+    // Mark entities as syncing
+    for (const entry of queue) {
+      if (entry.entity_type === 'task') {
+        await db.tasks.update(entry.entity_id, { _sync_status: 'syncing' });
+      } else if (entry.entity_type === 'comment') {
+        await db.comments.update(entry.entity_id, { _sync_status: 'syncing' });
+      }
+    }
 
     // Get device info
     const deviceId = getDeviceId();
@@ -287,20 +323,43 @@ export class SyncManager {
         vector_clock: pushResponse.serverVectorClock
       });
 
+      // Mark successfully processed items as synced
+      const processedEntries = queue.slice(0, pushResponse.processed);
+      for (const entry of processedEntries) {
+        if (entry.entity_type === 'task') {
+          await db.tasks.update(entry.entity_id, { 
+            _sync_status: 'synced',
+            _local_only: false 
+          });
+        } else if (entry.entity_type === 'comment') {
+          await db.comments.update(entry.entity_id, { 
+            _sync_status: 'synced',
+            _local_only: false 
+          });
+        }
+      }
+
       // Remove successfully processed items from queue
-      const processedIds = queue.slice(0, pushResponse.processed).map(e => e.id);
+      const processedIds = processedEntries.map(e => e.id);
       await db.sync_queue.bulkDelete(processedIds);
 
     } catch (error: any) {
       console.error('Batch push failed:', error);
       
-      // Update attempt count for all entries
+      // Update attempt count and mark entities as error
       for (const entry of queue) {
         await db.sync_queue.update(entry.id, {
           attempt_count: entry.attempt_count + 1,
           last_attempt_at: new Date().toISOString(),
           error_message: error.message || 'Unknown error'
         });
+        
+        // Mark entity as error status
+        if (entry.entity_type === 'task') {
+          await db.tasks.update(entry.entity_id, { _sync_status: 'error' });
+        } else if (entry.entity_type === 'comment') {
+          await db.comments.update(entry.entity_id, { _sync_status: 'error' });
+        }
       }
       throw error;
     }

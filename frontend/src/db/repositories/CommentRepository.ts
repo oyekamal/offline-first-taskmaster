@@ -214,6 +214,7 @@ export class CommentRepository {
       await db.comments.add({
         ...comment,
         _local_only: false,
+        _conflict: false,
         _sync_status: 'synced'
       });
     } else {
@@ -226,9 +227,11 @@ export class CommentRepository {
           _sync_status: 'conflict'
         });
       } else {
+        // Server version is newer, accept it and clear any conflict flags
         await db.comments.put({
           ...comment,
           _local_only: false,
+          _conflict: false,
           _sync_status: 'synced'
         });
       }

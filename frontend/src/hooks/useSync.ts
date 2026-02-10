@@ -82,11 +82,16 @@ export function useSync() {
     setConflicts(prev => prev.filter(c => c.conflict_id !== conflictId));
   };
 
+  const debouncedSync = () => {
+    syncManager.debouncedSync();
+  };
+
   return {
     status,
     conflicts,
     sync,
     fullSync,
+    debouncedSync,
     resolveConflict,
     dismissConflict,
     isSyncing: status.is_syncing,
