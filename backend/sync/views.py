@@ -205,7 +205,11 @@ def _process_task_changes(changes, user, device, client_vector_clock):
     for change in changes:
         change_id = change['id']
         operation = change['operation']
-        change_data = change['data']
+        change_data = change.get('data', {})
+
+        # Ensure id is always in change_data (frontend sends id at change level)
+        if 'id' not in change_data:
+            change_data['id'] = change_id
 
         try:
             if operation == 'create':
@@ -230,7 +234,7 @@ def _process_task_changes(changes, user, device, client_vector_clock):
                     processed.append(str(change_id))
 
         except Exception as e:
-            logger.error(f"Error processing task change {change_id}: {str(e)}")
+            logger.error(f"Error processing task change {change_id}: {str(e)}", exc_info=True)
             continue
 
     return conflicts, processed
@@ -403,7 +407,11 @@ def _process_comment_changes(changes, user, device, client_vector_clock):
     for change in changes:
         change_id = change['id']
         operation = change['operation']
-        change_data = change['data']
+        change_data = change.get('data', {})
+
+        # Ensure id is always in change_data (frontend sends id at change level)
+        if 'id' not in change_data:
+            change_data['id'] = change_id
 
         try:
             if operation == 'create':
@@ -427,7 +435,7 @@ def _process_comment_changes(changes, user, device, client_vector_clock):
             logger.info(f"Orphaned comment {change_id}: {str(e)}")
             processed.append(str(change_id))
         except Exception as e:
-            logger.error(f"Error processing comment change {change_id}: {str(e)}")
+            logger.error(f"Error processing comment change {change_id}: {str(e)}", exc_info=True)
             continue
 
     return conflicts, processed

@@ -332,11 +332,17 @@ export class SyncManager {
     const commentChanges: Array<{ id: string; operation: 'create' | 'update' | 'delete'; data: any }> = [];
 
     // Prepare changes in batch format
+    // Always fetch current entity from IndexedDB to ensure id, vector_clock,
+    // and version are included — entry.data may only have partial updates
     for (const entry of validQueue) {
+      const fullEntity = await this.getEntityData(entry.entity_type, entry.entity_id);
       const changeItem = {
         id: entry.entity_id,
         operation: entry.operation.toLowerCase() as 'create' | 'update' | 'delete',
-        data: entry.data || await this.getEntityData(entry.entity_type, entry.entity_id)
+        data: {
+          ...fullEntity,       // Full entity (has id, vector_clock, version, etc.)
+          ...(entry.data || {}) // Override with queued changes (latest values)
+        }
       };
 
       if (entry.entity_type === 'task') {
