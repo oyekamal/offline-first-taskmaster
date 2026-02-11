@@ -18,7 +18,7 @@ Offline-first collaborative task management app. Users create/edit/delete tasks 
 | Backend | Django 5.0, Django REST Framework 3.14, Python 3.12 |
 | Auth | JWT via SimpleJWT (access + refresh tokens) |
 | Database | PostgreSQL (server), IndexedDB via Dexie (client) |
-| Sync | Vector clocks, delta sync, 30s interval |
+| Sync | Vector clocks, delta sync, 30s interval, field-level auto-conflict resolution |
 | Background | Celery 5.3 + Redis (cache, broker, pub/sub) |
 | PWA | VitePWA plugin + custom service worker (`public/sw.js`) |
 | Testing | Playwright (e2e), pytest + factory-boy (backend) |
@@ -44,9 +44,12 @@ Three Django apps:
 **`sync/`** — Synchronization engine
 - Models: SyncLog, Conflict, Tombstone
 - Vector clock utilities: compare, merge, increment, detect conflicts
-- Push endpoint: accepts batched changes, detects conflicts via clock comparison
+- Auto-conflict resolution: field-level diffing with rules (priority: higher wins, tags: union merge, status: state machine, due_date: earlier wins, position: server wins, custom_fields: shallow merge; title/description/assigned_to: manual)
+- Push endpoint: accepts batched changes, detects conflicts via clock comparison, auto-resolves when possible
 - Pull endpoint: returns delta changes since timestamp + tombstones
-- Conflict resolution: local wins, server wins, or custom merge
+- Conflict resolution: auto-resolved, local wins, server wins, or custom merge
+- Rate limiting: push 60/min, pull 120/min, conflict resolution 30/min (per-user)
+- Cascade delete handling: ParentDeletedError for orphaned comments
 - Celery tasks: cleanup tombstones (90d), cleanup logs (30d), metrics
 
 **`taskmanager/`** — Django project config (settings, urls, celery, wsgi)
@@ -55,7 +58,8 @@ Three Django apps:
 
 **`services/`** — External communication
 - `apiClient.ts` — Axios client with JWT interceptors, auto-refresh on 401, all API methods
-- `syncManager.ts` — Singleton orchestrating pull-then-push sync cycle, conflict detection, status subscriptions
+- `syncManager.ts` — Singleton orchestrating pull-then-push sync cycle, conflict detection, permission error handling, cascade delete filtering, status subscriptions
+- `storageManager.ts` — Storage quota monitoring (60s interval), warning/critical thresholds, auto-cleanup of old synced data
 
 **`db/`** — Local persistence
 - `index.ts` — Dexie schema (tasks, comments, sync_queue, device_info), hooks for auto-generating UUIDs/timestamps/vector clocks
@@ -65,8 +69,9 @@ Three Django apps:
 **`hooks/`** — React business logic
 - `useTasks.ts` — Task list/detail/mutations/stats/search with live Dexie queries
 - `useComments.ts` — Comment list/threaded/mutations
-- `useSync.ts` — Sync status, manual sync trigger, conflict management
+- `useSync.ts` — Sync status, manual sync trigger, conflict management, permission error notifications
 - `useOnlineStatus.ts` — Network connectivity detection
+- `useStorageQuota.ts` — Storage quota state, cleanup trigger, usage formatting
 
 **`components/`** — UI
 - `LoginPage.tsx` — Auth form (test creds: user1@test.com / testpass123)
@@ -81,6 +86,7 @@ Three Django apps:
 - `SyncStatusIndicator.tsx` — Sync status in header
 - `OfflineIndicator.tsx` — Yellow offline banner
 - `ConflictResolver.tsx` — Conflict resolution modal
+- `StorageWarning.tsx` — Storage quota warning/critical banner with cleanup button
 
 **`types/index.ts`** — All TypeScript interfaces (Task, Comment, SyncQueueEntry, etc.)
 
@@ -108,7 +114,7 @@ backend/
     models.py          # SyncLog, Conflict, Tombstone
     views.py           # sync_push, sync_pull, ConflictViewSet
     serializers.py     # Sync request/response serializers
-    utils.py           # Vector clock operations
+    utils.py           # Vector clock operations + auto-conflict resolution
     tasks.py           # Celery cleanup/metrics tasks
     urls.py            # /api/sync/push/, /api/sync/pull/, /api/sync/conflicts/
   taskmanager/
@@ -129,19 +135,21 @@ frontend/
     services/
       apiClient.ts     # Axios + JWT + all API methods
       syncManager.ts   # Sync orchestrator singleton
+      storageManager.ts # Storage quota monitoring + cleanup
     db/
       index.ts         # Dexie schema + device ID management
       repositories/
         TaskRepository.ts
         CommentRepository.ts
     hooks/
-      useTasks.ts, useComments.ts, useSync.ts, useOnlineStatus.ts
+      useTasks.ts, useComments.ts, useSync.ts, useOnlineStatus.ts, useStorageQuota.ts
     components/
       LoginPage.tsx, AuthenticatedApp.tsx, TaskCard.tsx,
       TaskDetail.tsx, TaskForm.tsx, TaskFilters.tsx,
       TaskListDraggable.tsx, TaskListVirtualized.tsx,
       CommentSection.tsx, SyncStatusIndicator.tsx,
-      OfflineIndicator.tsx, ConflictResolver.tsx
+      OfflineIndicator.tsx, ConflictResolver.tsx,
+      StorageWarning.tsx
     utils/
       dateFormat.ts, fractionalIndexing.ts
   e2e/                 # Playwright tests
@@ -154,18 +162,21 @@ frontend/
 
 ## HOW: Working on This Project
 
-### Running the Backend
+### Running the Backend (Docker)
 
 ```bash
 cd backend
-source venv/bin/activate
-python manage.py runserver              # http://localhost:8000
-python manage.py create_test_data       # Seed test data
-python manage.py cleanup_sync_data      # Manual cleanup
-python manage.py migrate                # Run migrations
+docker compose up -d                    # Start all services (web, db, redis, celery)
+docker compose exec web python manage.py runserver 0.0.0.0:8000  # Dev server
+docker compose exec web python manage.py create_test_data         # Seed test data
+docker compose exec web python manage.py cleanup_sync_data        # Manual cleanup
+docker compose exec web python manage.py migrate                  # Run migrations
+docker compose exec web python manage.py check                    # Validate config
+docker compose down                     # Stop all services
+docker compose up -d --build            # Rebuild after code changes
 ```
 
-Requires: PostgreSQL running, `.env` configured (DB_NAME, DB_USER, DB_PASSWORD, SECRET_KEY, etc.)
+Requires: Docker + Docker Compose. `.env` configured (DB_NAME, DB_USER, DB_PASSWORD, SECRET_KEY, etc.)
 
 ### Running the Frontend
 
@@ -183,10 +194,9 @@ npm run preview                         # Preview production build
 cd frontend
 npx playwright test e2e/ --reporter=list
 
-# Backend tests
+# Backend tests (via Docker)
 cd backend
-source venv/bin/activate
-pytest
+docker compose exec web pytest sync/tests.py -v
 ```
 
 ### Verifying Changes
@@ -194,7 +204,7 @@ pytest
 1. **TypeScript**: `cd frontend && npx tsc --noEmit` (strict mode)
 2. **Lint**: `cd frontend && npm run lint`
 3. **Build**: `cd frontend && npm run build`
-4. **Backend**: `cd backend && python manage.py check`
+4. **Backend**: `cd backend && docker compose exec web python manage.py check`
 5. **E2E**: `cd frontend && npx playwright test e2e/ --reporter=list`
 
 ### API Endpoints Quick Reference
@@ -240,6 +250,9 @@ Always use `.results` to get the array.
 - JWT access token lifetime: 24 hours
 - JWT refresh token lifetime: 7 days
 - API pagination default: 50 items
+- Rate limits: push 60/min, pull 120/min, conflict resolution 30/min (per-user)
+- Storage warning threshold: 80%, critical: 95%
+- Storage cleanup: synced data older than 90 days
 
 ### Data Flow (Offline-First)
 
@@ -269,21 +282,23 @@ See `doc/OFFLINE_FIRST_AUDIT.md` for full audit details.
 - Offline CRUD (tasks + comments) with IndexedDB-first writes
 - Sync queue, periodic sync (30s), auto-sync on reconnect
 - Vector clock conflict detection (frontend + backend)
+- Auto-conflict resolution: field-level diffing with rules for priority, tags, status, due_date, position, custom_fields (title/description/assigned_to require manual resolution)
 - Manual conflict resolution UI (local/server/custom)
 - Delta sync with pagination, batch push
 - Tombstones + soft deletes, audit trail (TaskHistory)
 - JWT auth with auto-refresh, device tracking
 - PWA with service worker caching
+- Rate limiting on sync endpoints (push 60/min, pull 120/min, conflict 30/min)
+- Storage quota monitoring with auto-cleanup and warning banners
+- Cascade delete handling (orphaned comments gracefully processed)
+- Graceful permission revocation (403 detection, stops retry, user notification)
 
 **Designed in docs but NOT implemented:**
 - Operational Transformation (text merge) — zero code
-- Auto-conflict resolution (higher-priority-wins, union merge, etc.) — zero code
 - WebSocket real-time updates — no Django Channels
-- Rate limiting on sync endpoints — no throttle classes
 - Attachments/file sync — no frontend model or upload code
 - End-to-end encryption — no Web Crypto API usage
 - Status transition validation — placeholder `pass` in serializer
-- Storage quota handling — no quota checks
 - Push notifications — SW handler exists but no backend sender
 
 ## Known Issues & Gotchas
@@ -296,3 +311,5 @@ See `doc/OFFLINE_FIRST_AUDIT.md` for full audit details.
 6. **Custom user model** — `AUTH_USER_MODEL = 'core.User'`, email-based login
 7. **Path alias** — Frontend uses `@/` → `src/` (configured in vite.config.ts and tsconfig.json)
 8. **Test credentials** — user1@test.com / testpass123 (after running create_test_data)
+9. **Backend runs in Docker** — all `manage.py` commands must use `docker compose exec web python manage.py ...` from the `backend/` directory
+10. **UUID serialization** — Django UUID fields aren't JSON-serializable. Use `json.loads(json.dumps(data, default=str))` when storing serializer `.data` in JSONFields (e.g., Conflict model)
