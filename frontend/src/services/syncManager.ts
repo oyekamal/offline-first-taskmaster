@@ -29,6 +29,7 @@ export class SyncManager {
   private onlineStatusListener: (() => void) | null = null;
   private statusCallbacks: Set<(status: SyncStatusInfo) => void> = new Set();
   private conflictCallbacks: Set<(conflicts: ConflictResolution[]) => void> = new Set();
+  private permissionErrorCallbacks: Set<(count: number) => void> = new Set();
 
   /**
    * Initialize sync manager
@@ -83,6 +84,7 @@ export class SyncManager {
     }
     this.statusCallbacks.clear();
     this.conflictCallbacks.clear();
+    this.permissionErrorCallbacks.clear();
   }
 
   /**
@@ -103,6 +105,14 @@ export class SyncManager {
   }
 
   /**
+   * Subscribe to permission error notifications
+   */
+  onPermissionError(callback: (count: number) => void): () => void {
+    this.permissionErrorCallbacks.add(callback);
+    return () => this.permissionErrorCallbacks.delete(callback);
+  }
+
+  /**
    * Get current sync status
    */
   async getStatus(): Promise<SyncStatusInfo> {
@@ -110,6 +120,8 @@ export class SyncManager {
     const conflictTasks = await db.tasks.filter(t => t._conflict === true).count();
     const conflictComments = await db.comments.filter(c => c._conflict === true).count();
     const errorCount = await db.sync_queue.filter(e => e.error_message !== null).count();
+    const permissionDeniedTasks = await db.tasks.filter(t => t._sync_status === 'permission_denied').count();
+    const permissionDeniedComments = await db.comments.filter(c => c._sync_status === 'permission_denied').count();
 
     const deviceInfo = await db.device_info.get(getDeviceId());
 
@@ -118,6 +130,7 @@ export class SyncManager {
       pending_count: pendingCount,
       conflict_count: conflictTasks + conflictComments,
       error_count: errorCount,
+      permission_error_count: permissionDeniedTasks + permissionDeniedComments,
       last_sync_at: deviceInfo?.last_sync_at || null,
       is_online: navigator.onLine
     };
@@ -225,6 +238,19 @@ export class SyncManager {
         if (tombstone.entity_type === 'task') {
           await db.tasks.where('id').equals(tombstone.entity_id).delete();
           await db.sync_queue.where('entity_id').equals(tombstone.entity_id).delete();
+
+          // Cascade: delete all local comments belonging to this task
+          const orphanedComments = await db.comments
+            .where('task')
+            .equals(tombstone.entity_id)
+            .toArray();
+          if (orphanedComments.length > 0) {
+            const orphanedIds = orphanedComments.map(c => c.id);
+            await db.comments.where('id').anyOf(orphanedIds).delete();
+            // Also remove their sync queue entries
+            await db.sync_queue.where('entity_id').anyOf(orphanedIds).delete();
+            console.log(`Cascade-deleted ${orphanedIds.length} orphaned comments for deleted task ${tombstone.entity_id}`);
+          }
         } else if (tombstone.entity_type === 'comment') {
           await db.comments.where('id').equals(tombstone.entity_id).delete();
           await db.sync_queue.where('entity_id').equals(tombstone.entity_id).delete();
@@ -261,10 +287,34 @@ export class SyncManager {
       return;
     }
 
-    console.log(`Processing ${queue.length} queued operations`);
+    // Filter out orphaned comment entries (parent task deleted locally)
+    const validQueue: SyncQueueEntry[] = [];
+    for (const entry of queue) {
+      if (entry.entity_type === 'comment' && entry.operation !== 'DELETE') {
+        const taskId = (entry.data as Partial<Comment>)?.task;
+        if (taskId) {
+          const parentTask = await db.tasks.get(taskId);
+          if (!parentTask) {
+            // Parent task doesn't exist locally — orphaned comment
+            console.log(`Removing orphaned comment ${entry.entity_id} from sync queue (parent task ${taskId} deleted)`);
+            await db.sync_queue.delete(entry.id);
+            await db.comments.where('id').equals(entry.entity_id).delete();
+            continue;
+          }
+        }
+      }
+      validQueue.push(entry);
+    }
+
+    if (validQueue.length === 0) {
+      console.log('No valid changes to push after orphan cleanup');
+      return;
+    }
+
+    console.log(`Processing ${validQueue.length} queued operations`);
 
     // Mark entities as syncing
-    for (const entry of queue) {
+    for (const entry of validQueue) {
       if (entry.entity_type === 'task') {
         await db.tasks.update(entry.entity_id, { _sync_status: 'syncing' });
       } else if (entry.entity_type === 'comment') {
@@ -282,7 +332,7 @@ export class SyncManager {
     const commentChanges: Array<{ id: string; operation: 'create' | 'update' | 'delete'; data: any }> = [];
 
     // Prepare changes in batch format
-    for (const entry of queue) {
+    for (const entry of validQueue) {
       const changeItem = {
         id: entry.entity_id,
         operation: entry.operation.toLowerCase() as 'create' | 'update' | 'delete',
@@ -324,7 +374,7 @@ export class SyncManager {
       });
 
       // Mark successfully processed items as synced
-      const processedEntries = queue.slice(0, pushResponse.processed);
+      const processedEntries = validQueue.slice(0, pushResponse.processed);
       for (const entry of processedEntries) {
         if (entry.entity_type === 'task') {
           await db.tasks.update(entry.entity_id, { 
@@ -345,22 +395,40 @@ export class SyncManager {
 
     } catch (error: any) {
       console.error('Batch push failed:', error);
-      
-      // Update attempt count and mark entities as error
-      for (const entry of queue) {
-        await db.sync_queue.update(entry.id, {
-          attempt_count: entry.attempt_count + 1,
-          last_attempt_at: new Date().toISOString(),
-          error_message: error.message || 'Unknown error'
-        });
-        
-        // Mark entity as error status
-        if (entry.entity_type === 'task') {
-          await db.tasks.update(entry.entity_id, { _sync_status: 'error' });
-        } else if (entry.entity_type === 'comment') {
-          await db.comments.update(entry.entity_id, { _sync_status: 'error' });
+
+      const is403 = error?.response?.status === 403;
+
+      for (const entry of validQueue) {
+        if (is403) {
+          // Permission denied — stop retrying by maxing out attempt_count
+          await db.sync_queue.update(entry.id, {
+            attempt_count: 999,
+            last_attempt_at: new Date().toISOString(),
+            error_message: 'Permission denied — you may have lost access to this organization'
+          });
+          if (entry.entity_type === 'task') {
+            await db.tasks.update(entry.entity_id, { _sync_status: 'permission_denied' as any });
+          } else if (entry.entity_type === 'comment') {
+            await db.comments.update(entry.entity_id, { _sync_status: 'permission_denied' as any });
+          }
+        } else {
+          await db.sync_queue.update(entry.id, {
+            attempt_count: entry.attempt_count + 1,
+            last_attempt_at: new Date().toISOString(),
+            error_message: error.message || 'Unknown error'
+          });
+          if (entry.entity_type === 'task') {
+            await db.tasks.update(entry.entity_id, { _sync_status: 'error' });
+          } else if (entry.entity_type === 'comment') {
+            await db.comments.update(entry.entity_id, { _sync_status: 'error' });
+          }
         }
       }
+
+      if (is403) {
+        await this.notifyPermissionError();
+      }
+
       throw error;
     }
   }
@@ -497,6 +565,33 @@ export class SyncManager {
    */
   private notifyConflict(conflict: ConflictResolution) {
     this.conflictCallbacks.forEach(callback => callback([conflict]));
+  }
+
+  /**
+   * Clear permission errors - removes denied entries from sync queue and resets entity status
+   */
+  async clearPermissionErrors(): Promise<void> {
+    const deniedTasks = await db.tasks.filter(t => t._sync_status === 'permission_denied').toArray();
+    const deniedComments = await db.comments.filter(c => c._sync_status === 'permission_denied').toArray();
+
+    for (const task of deniedTasks) {
+      await db.sync_queue.where('entity_id').equals(task.id).delete();
+      await db.tasks.update(task.id, { _sync_status: 'error' });
+    }
+    for (const comment of deniedComments) {
+      await db.sync_queue.where('entity_id').equals(comment.id).delete();
+      await db.comments.update(comment.id, { _sync_status: 'error' });
+    }
+
+    this.notifyStatusChange();
+  }
+
+  /**
+   * Notify permission error to subscribers
+   */
+  private async notifyPermissionError() {
+    const status = await this.getStatus();
+    this.permissionErrorCallbacks.forEach(callback => callback(status.permission_error_count));
   }
 
   /**

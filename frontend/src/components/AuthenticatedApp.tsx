@@ -6,6 +6,7 @@
 import { useEffect, useState } from 'react';
 import { Toaster } from 'react-hot-toast';
 import { syncManager } from '../services/syncManager';
+import { storageManager } from '../services/storageManager';
 import { useSync, useTaskMutations } from '../hooks';
 import { Task, TaskFilters, CreateTaskInput, TaskOrderBy } from '../types';
 
@@ -18,6 +19,7 @@ import { TaskListDraggable } from './TaskListDraggable';
 import { TaskListVirtualized } from './TaskListVirtualized';
 import { TaskDetail } from './TaskDetail';
 import { TaskForm } from './TaskForm';
+import { StorageWarning } from './StorageWarning';
 
 interface AuthenticatedAppProps {
   currentUser: any;
@@ -36,10 +38,14 @@ export function AuthenticatedApp({ currentUser, onLogout }: AuthenticatedAppProp
   const { conflicts, resolveConflict, dismissConflict } = useSync();
   const { createTask, isLoading } = useTaskMutations();
 
-  // Initialize sync manager once
+  // Initialize sync manager and storage monitoring
   useEffect(() => {
     syncManager.initialize();
-    return () => syncManager.destroy();
+    storageManager.startMonitoring();
+    return () => {
+      syncManager.destroy();
+      storageManager.stopMonitoring();
+    };
   }, []);
 
   const handleCreateTask = async (data: CreateTaskInput) => {
@@ -60,6 +66,9 @@ export function AuthenticatedApp({ currentUser, onLogout }: AuthenticatedAppProp
 
       {/* Offline indicator */}
       <OfflineIndicator />
+
+      {/* Storage quota warning */}
+      <StorageWarning />
 
       {/* Header */}
       <header className="bg-white border-b border-gray-200 shadow-sm">

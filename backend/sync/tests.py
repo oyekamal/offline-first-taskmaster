@@ -14,6 +14,8 @@ from sync.utils import (
     increment_vector_clock, detect_conflict,
     ClockRelation
 )
+from sync.utils import auto_resolve_task_conflict, auto_resolve_comment_conflict
+from django.test import override_settings
 import uuid
 import time
 
@@ -501,6 +503,496 @@ class TestConflictDetection:
         )
 
         assert has_conflict is False
+
+
+@pytest.mark.django_db
+class TestAutoConflictResolution:
+    """Test auto_resolve_task_conflict and auto_resolve_comment_conflict utilities."""
+
+    def test_different_fields_auto_merge(self):
+        """Local changes priority, server changes status - should auto-resolve with both."""
+        local_data = {
+            'title': 'Same Title',
+            'status': 'todo',
+            'priority': 'high',
+            'tags': [],
+            'description': 'Same desc',
+        }
+        server_data = {
+            'title': 'Same Title',
+            'status': 'in_progress',
+            'priority': 'medium',
+            'tags': [],
+            'description': 'Same desc',
+        }
+
+        resolved, auto_resolved, unresolvable = auto_resolve_task_conflict(local_data, server_data)
+
+        assert auto_resolved is True
+        assert unresolvable == []
+        # priority: high (rank 2) > medium (rank 1) -> 'high'
+        assert resolved['priority'] == 'high'
+        # status: in_progress (rank 1) > todo (rank 0) -> 'in_progress'
+        assert resolved['status'] == 'in_progress'
+
+    def test_same_field_title_conflict(self):
+        """Both change title - cannot auto-resolve, returns unresolvable=['title']."""
+        local_data = {
+            'title': 'Local Title',
+            'status': 'todo',
+            'priority': 'medium',
+        }
+        server_data = {
+            'title': 'Server Title',
+            'status': 'todo',
+            'priority': 'medium',
+        }
+
+        resolved, auto_resolved, unresolvable = auto_resolve_task_conflict(local_data, server_data)
+
+        assert auto_resolved is False
+        assert 'title' in unresolvable
+
+    def test_priority_higher_wins(self):
+        """local='low', server='urgent' - auto-resolves to 'urgent'."""
+        local_data = {
+            'title': 'Same',
+            'priority': 'low',
+        }
+        server_data = {
+            'title': 'Same',
+            'priority': 'urgent',
+        }
+
+        resolved, auto_resolved, unresolvable = auto_resolve_task_conflict(local_data, server_data)
+
+        assert auto_resolved is True
+        assert resolved['priority'] == 'urgent'
+
+    def test_tags_union_merge(self):
+        """local=['bug'], server=['feature'] - auto-resolves to sorted union."""
+        local_data = {
+            'title': 'Same',
+            'tags': ['bug'],
+        }
+        server_data = {
+            'title': 'Same',
+            'tags': ['feature'],
+        }
+
+        resolved, auto_resolved, unresolvable = auto_resolve_task_conflict(local_data, server_data)
+
+        assert auto_resolved is True
+        assert resolved['tags'] == ['bug', 'feature']
+
+    def test_status_more_progressed_wins(self):
+        """local='in_progress', server='done' - auto-resolves to 'done'."""
+        local_data = {
+            'title': 'Same',
+            'status': 'in_progress',
+        }
+        server_data = {
+            'title': 'Same',
+            'status': 'done',
+        }
+
+        resolved, auto_resolved, unresolvable = auto_resolve_task_conflict(local_data, server_data)
+
+        assert auto_resolved is True
+        assert resolved['status'] == 'done'
+
+    def test_due_date_earlier_wins(self):
+        """local='2026-03-15', server='2026-03-10' - auto-resolves to '2026-03-10'."""
+        local_data = {
+            'title': 'Same',
+            'due_date': '2026-03-15',
+        }
+        server_data = {
+            'title': 'Same',
+            'due_date': '2026-03-10',
+        }
+
+        resolved, auto_resolved, unresolvable = auto_resolve_task_conflict(local_data, server_data)
+
+        assert auto_resolved is True
+        assert resolved['due_date'] == '2026-03-10'
+
+    def test_comment_content_conflict(self):
+        """Different content - cannot auto-resolve."""
+        local_data = {'content': 'Local comment text'}
+        server_data = {'content': 'Server comment text'}
+
+        resolved, auto_resolved, unresolvable = auto_resolve_comment_conflict(local_data, server_data)
+
+        assert auto_resolved is False
+        assert 'content' in unresolvable
+
+    def test_comment_same_content(self):
+        """Same content - auto-resolves."""
+        local_data = {'content': 'Same comment text'}
+        server_data = {'content': 'Same comment text'}
+
+        resolved, auto_resolved, unresolvable = auto_resolve_comment_conflict(local_data, server_data)
+
+        assert auto_resolved is True
+        assert unresolvable == []
+
+
+@pytest.mark.django_db
+class TestAutoConflictResolutionAPI:
+    """Test the full sync push API with auto-resolution."""
+
+    def setup_method(self):
+        """Set up test data."""
+        self.client = APIClient()
+        self.organization = Organization.objects.create(
+            name="Test Org",
+            slug="test-org"
+        )
+        self.user = User.objects.create_user(
+            email="test@example.com",
+            password="testpass123",
+            name="Test User",
+            organization=self.organization
+        )
+        self.device = Device.objects.create(
+            user=self.user,
+            device_name="Test Device",
+            device_fingerprint="test-device-123"
+        )
+        self.client.force_authenticate(user=self.user)
+
+    def test_push_auto_resolves_different_fields(self):
+        """Push with different field changed and concurrent clock auto-resolves."""
+        # Create a task on server with server-only vector clock
+        task = Task.objects.create(
+            organization=self.organization,
+            title="Original Title",
+            description="Original description",
+            status="todo",
+            priority="medium",
+            tags=[],
+            created_by=self.user,
+            last_modified_by=self.user,
+            vector_clock={"server": 5}
+        )
+
+        device_id = str(self.device.id)
+
+        # Push update that changes status (auto-resolvable) with concurrent clock
+        push_data = {
+            'deviceId': device_id,
+            'vectorClock': {device_id: 3},
+            'timestamp': int(time.time() * 1000),
+            'changes': {
+                'tasks': [
+                    {
+                        'id': str(task.id),
+                        'operation': 'update',
+                        'data': {
+                            'id': str(task.id),
+                            'title': 'Original Title',
+                            'description': 'Original description',
+                            'status': 'in_progress',
+                            'priority': 'medium',
+                            'tags': [],
+                            'version': 1,
+                            'vector_clock': {device_id: 3}
+                        }
+                    }
+                ]
+            }
+        }
+
+        response = self.client.post(
+            '/api/sync/push/',
+            push_data,
+            format='json',
+            HTTP_X_DEVICE_ID=device_id
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.data['success'] is True
+        assert len(response.data['conflicts']) == 0
+        assert response.data['processed'] == 1
+
+        # Verify a Conflict record exists with auto_resolved strategy
+        conflict_record = Conflict.objects.filter(
+            entity_type='task',
+            entity_id=task.id,
+            resolution_strategy='auto_resolved'
+        )
+        assert conflict_record.exists()
+
+    def test_push_creates_manual_conflict_for_title(self):
+        """Push with different title AND concurrent clock creates manual conflict."""
+        task = Task.objects.create(
+            organization=self.organization,
+            title="Server Title",
+            status="todo",
+            priority="medium",
+            created_by=self.user,
+            last_modified_by=self.user,
+            vector_clock={"server": 5}
+        )
+
+        device_id = str(self.device.id)
+
+        push_data = {
+            'deviceId': device_id,
+            'vectorClock': {device_id: 3},
+            'timestamp': int(time.time() * 1000),
+            'changes': {
+                'tasks': [
+                    {
+                        'id': str(task.id),
+                        'operation': 'update',
+                        'data': {
+                            'id': str(task.id),
+                            'title': 'Client Title',
+                            'status': 'todo',
+                            'priority': 'medium',
+                            'version': 1,
+                            'vector_clock': {device_id: 3}
+                        }
+                    }
+                ]
+            }
+        }
+
+        response = self.client.post(
+            '/api/sync/push/',
+            push_data,
+            format='json',
+            HTTP_X_DEVICE_ID=device_id
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert len(response.data['conflicts']) == 1
+
+
+@pytest.mark.django_db
+class TestCascadeDeleteHandling:
+    """Tests that pushing comments for deleted tasks is handled gracefully."""
+
+    def setup_method(self):
+        """Set up test data."""
+        self.client = APIClient()
+        self.organization = Organization.objects.create(
+            name="Test Org",
+            slug="test-org"
+        )
+        self.user = User.objects.create_user(
+            email="test@example.com",
+            password="testpass123",
+            name="Test User",
+            organization=self.organization
+        )
+        self.device = Device.objects.create(
+            user=self.user,
+            device_name="Test Device",
+            device_fingerprint="test-device-123"
+        )
+        self.client.force_authenticate(user=self.user)
+
+    def test_create_comment_for_deleted_task(self):
+        """Create a comment for a soft-deleted task - processed as orphan, no Comment created."""
+        task = Task.objects.create(
+            organization=self.organization,
+            title="Task to delete",
+            created_by=self.user,
+            last_modified_by=self.user,
+            vector_clock={"server": 1}
+        )
+        task.soft_delete()
+
+        device_id = str(self.device.id)
+        comment_id = str(uuid.uuid4())
+
+        push_data = {
+            'deviceId': device_id,
+            'vectorClock': {device_id: 1},
+            'timestamp': int(time.time() * 1000),
+            'changes': {
+                'comments': [
+                    {
+                        'id': comment_id,
+                        'operation': 'create',
+                        'data': {
+                            'id': comment_id,
+                            'task': str(task.id),
+                            'content': 'Comment on deleted task',
+                            'version': 1,
+                            'vector_clock': {device_id: 1},
+                            'created_at': int(time.time() * 1000)
+                        }
+                    }
+                ]
+            }
+        }
+
+        response = self.client.post(
+            '/api/sync/push/',
+            push_data,
+            format='json',
+            HTTP_X_DEVICE_ID=device_id
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.data['processed'] == 1
+
+        # No Comment should have been actually created
+        assert Comment.all_objects.filter(id=comment_id).count() == 0
+
+    def test_update_comment_for_deleted_task(self):
+        """Update a comment whose parent task is soft-deleted - processed, content unchanged."""
+        task = Task.objects.create(
+            organization=self.organization,
+            title="Task to delete",
+            created_by=self.user,
+            last_modified_by=self.user,
+            vector_clock={"server": 1}
+        )
+        comment = Comment.objects.create(
+            task=task,
+            user=self.user,
+            content="Original comment content",
+            version=1,
+            vector_clock={"server": 1},
+            last_modified_by=self.user,
+            last_modified_device=self.device
+        )
+
+        # Now soft-delete the task
+        task.soft_delete()
+
+        device_id = str(self.device.id)
+
+        push_data = {
+            'deviceId': device_id,
+            'vectorClock': {device_id: 2},
+            'timestamp': int(time.time() * 1000),
+            'changes': {
+                'comments': [
+                    {
+                        'id': str(comment.id),
+                        'operation': 'update',
+                        'data': {
+                            'id': str(comment.id),
+                            'task': str(task.id),
+                            'content': 'Updated comment content',
+                            'version': 2,
+                            'vector_clock': {device_id: 2}
+                        }
+                    }
+                ]
+            }
+        }
+
+        response = self.client.post(
+            '/api/sync/push/',
+            push_data,
+            format='json',
+            HTTP_X_DEVICE_ID=device_id
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.data['processed'] == 1
+
+        # Comment content should remain unchanged
+        comment.refresh_from_db()
+        assert comment.content == "Original comment content"
+
+
+@pytest.mark.django_db
+class TestRateLimiting:
+    """Test rate limiting on sync push endpoint."""
+
+    def setup_method(self):
+        """Set up test data."""
+        self.client = APIClient()
+        self.organization = Organization.objects.create(
+            name="Test Org",
+            slug="test-org"
+        )
+        self.user = User.objects.create_user(
+            email="test@example.com",
+            password="testpass123",
+            name="Test User",
+            organization=self.organization
+        )
+        self.device = Device.objects.create(
+            user=self.user,
+            device_name="Test Device",
+            device_fingerprint="test-device-123"
+        )
+        self.client.force_authenticate(user=self.user)
+
+    def test_push_rate_limit(self):
+        """Verify SyncPushThrottle is applied and rejects after limit."""
+        from unittest.mock import patch
+        from django.core.cache import cache
+        cache.clear()
+
+        # Track how many times allow_request is called and reject on 3rd
+        call_count = {'n': 0}
+        orig_allow = __import__('sync.views', fromlist=['SyncPushThrottle']).SyncPushThrottle.allow_request
+
+        def limited_allow(self_throttle, request, view):
+            call_count['n'] += 1
+            if call_count['n'] > 2:
+                self_throttle.wait = lambda: 60
+                return False
+            return True
+
+        with patch.object(
+            __import__('sync.views', fromlist=['SyncPushThrottle']).SyncPushThrottle,
+            'allow_request', limited_allow
+        ):
+
+            device_id = str(self.device.id)
+
+            def make_push_request(idx):
+                tid = str(uuid.uuid4())
+                push_data = {
+                    'deviceId': device_id,
+                    'vectorClock': {device_id: idx},
+                    'timestamp': int(time.time() * 1000),
+                    'changes': {
+                        'tasks': [
+                            {
+                                'id': tid,
+                                'operation': 'create',
+                                'data': {
+                                    'id': tid,
+                                    'title': f'Rate limit test task {idx}',
+                                    'status': 'todo',
+                                    'priority': 'medium',
+                                    'version': 1,
+                                    'vector_clock': {device_id: idx},
+                                    'created_at': int(time.time() * 1000)
+                                }
+                            }
+                        ]
+                    }
+                }
+                return self.client.post(
+                    '/api/sync/push/',
+                    push_data,
+                    format='json',
+                    HTTP_X_DEVICE_ID=device_id
+                )
+
+            # First two requests should succeed
+            response1 = make_push_request(1)
+            assert response1.status_code == status.HTTP_200_OK
+
+            response2 = make_push_request(2)
+            assert response2.status_code == status.HTTP_200_OK
+
+            # Third request should be throttled
+            response3 = make_push_request(3)
+            assert response3.status_code == status.HTTP_429_TOO_MANY_REQUESTS
 
 
 if __name__ == '__main__':

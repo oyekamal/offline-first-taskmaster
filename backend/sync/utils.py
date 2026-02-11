@@ -301,3 +301,122 @@ def calculate_sync_priority(entity_type: str, operation: str, changes: dict) -> 
 
     # Background: Everything else
     return 5
+
+
+# ---- AUTO-CONFLICT RESOLUTION ---- #
+
+PRIORITY_RANK = {'low': 0, 'medium': 1, 'high': 2, 'urgent': 3}
+STATUS_RANK = {'todo': 0, 'in_progress': 1, 'done': 2}
+SPECIAL_STATUSES = {'blocked', 'cancelled'}
+MANUAL_RESOLVE_FIELDS = {'title', 'description', 'assigned_to'}
+TASK_DIFFABLE_FIELDS = {
+    'title', 'description', 'status', 'priority', 'due_date',
+    'assigned_to', 'tags', 'custom_fields', 'position'
+}
+
+
+def _get_differing_fields(local_data: dict, server_data: dict, field_set: set) -> set:
+    """Return set of fields that differ between local and server versions."""
+    differing = set()
+    for field in field_set:
+        local_val = local_data.get(field)
+        server_val = server_data.get(field)
+        if local_val is None and server_val is None:
+            continue
+        if local_val != server_val:
+            differing.add(field)
+    return differing
+
+
+def _auto_resolve_field(field: str, local_val, server_val):
+    """
+    Attempt to auto-resolve a single conflicting field.
+    Returns (resolved_value, was_resolved).
+    """
+    if field == 'priority':
+        local_rank = PRIORITY_RANK.get(local_val, -1)
+        server_rank = PRIORITY_RANK.get(server_val, -1)
+        return (local_val if local_rank >= server_rank else server_val), True
+
+    if field == 'tags':
+        local_tags = set(local_val or [])
+        server_tags = set(server_val or [])
+        return sorted(local_tags | server_tags), True
+
+    if field == 'status':
+        if local_val in SPECIAL_STATUSES or server_val in SPECIAL_STATUSES:
+            return None, False
+        local_rank = STATUS_RANK.get(local_val, -1)
+        server_rank = STATUS_RANK.get(server_val, -1)
+        if local_rank < 0 or server_rank < 0:
+            return None, False
+        return (local_val if local_rank >= server_rank else server_val), True
+
+    if field == 'due_date':
+        if local_val is None and server_val is None:
+            return None, True
+        if local_val is None:
+            return server_val, True
+        if server_val is None:
+            return local_val, True
+        return min(str(local_val), str(server_val)), True
+
+    if field == 'position':
+        return server_val, True
+
+    if field == 'custom_fields':
+        merged = {}
+        merged.update(local_val or {})
+        merged.update(server_val or {})
+        return merged, True
+
+    # title, description, assigned_to - cannot auto-resolve
+    return None, False
+
+
+def auto_resolve_task_conflict(local_data: dict, server_task_data: dict):
+    """
+    Attempt field-level auto-resolution for a task conflict.
+
+    Returns:
+        (resolved_data, auto_resolved, unresolvable_fields)
+    """
+    differing = _get_differing_fields(local_data, server_task_data, TASK_DIFFABLE_FIELDS)
+
+    if not differing:
+        return local_data, True, []
+
+    resolved = dict(server_task_data)
+    unresolvable = []
+
+    for field in differing:
+        local_val = local_data.get(field)
+        server_val = server_task_data.get(field)
+        resolved_val, was_resolved = _auto_resolve_field(field, local_val, server_val)
+
+        if was_resolved:
+            resolved[field] = resolved_val
+        else:
+            unresolvable.append(field)
+
+    if unresolvable:
+        return None, False, unresolvable
+
+    return resolved, True, []
+
+
+def auto_resolve_comment_conflict(local_data: dict, server_comment_data: dict):
+    """
+    Attempt auto-resolution for a comment conflict.
+    Content conflicts cannot be auto-resolved.
+
+    Returns:
+        (resolved_data, auto_resolved, unresolvable_fields)
+    """
+    local_content = local_data.get('content', '')
+    server_content = server_comment_data.get('content', '')
+
+    if local_content == server_content:
+        return local_data, True, []
+
+    return None, False, ['content']

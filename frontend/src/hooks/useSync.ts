@@ -22,6 +22,7 @@ export function useSync() {
     pending_count: 0,
     conflict_count: 0,
     error_count: 0,
+    permission_error_count: 0,
     last_sync_at: null,
     is_online: navigator.onLine
   });
@@ -41,9 +42,20 @@ export function useSync() {
       toast.error(`${newConflicts.length} sync conflict(s) detected`);
     });
 
+    // Subscribe to permission error notifications
+    const unsubscribePermission = syncManager.onPermissionError((count) => {
+      if (count > 0) {
+        toast.error(
+          `Permission denied: ${count} change(s) could not be synced. You may have lost access.`,
+          { duration: 8000 }
+        );
+      }
+    });
+
     return () => {
       unsubscribeStatus();
       unsubscribeConflicts();
+      unsubscribePermission();
     };
   }, []);
 
@@ -86,6 +98,15 @@ export function useSync() {
     syncManager.debouncedSync();
   };
 
+  const clearPermissionErrors = async () => {
+    try {
+      await syncManager.clearPermissionErrors();
+      toast.success('Permission errors dismissed');
+    } catch (error) {
+      toast.error('Failed to clear permission errors');
+    }
+  };
+
   return {
     status,
     conflicts,
@@ -94,9 +115,11 @@ export function useSync() {
     debouncedSync,
     resolveConflict,
     dismissConflict,
+    clearPermissionErrors,
     isSyncing: status.is_syncing,
     pendingCount: status.pending_count,
     conflictCount: status.conflict_count,
+    permissionErrorCount: status.permission_error_count,
     isOnline: status.is_online,
     lastSyncAt: status.last_sync_at
   };

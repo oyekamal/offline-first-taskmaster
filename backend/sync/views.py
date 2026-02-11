@@ -2,12 +2,14 @@
 Views for synchronization operations.
 """
 from rest_framework import viewsets, status
-from rest_framework.decorators import api_view, permission_classes, action
+from rest_framework.decorators import api_view, permission_classes, action, throttle_classes
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.throttling import SimpleRateThrottle
 from django.db import transaction
 from django.utils import timezone
 from datetime import datetime, timedelta, timezone as dt_timezone
+import json
 import logging
 import time
 
@@ -21,7 +23,8 @@ from .serializers import (
 from .utils import (
     compare_vector_clocks, merge_vector_clocks,
     detect_conflict, get_organization_vector_clock,
-    ClockRelation
+    ClockRelation,
+    auto_resolve_task_conflict, auto_resolve_comment_conflict
 )
 from tasks.models import Task, Comment
 from tasks.serializers import TaskSerializer, CommentSerializer
@@ -31,8 +34,48 @@ from core.permissions import IsOrganizationMember
 logger = logging.getLogger(__name__)
 
 
+def _json_safe(data):
+    """Convert serializer data to JSON-safe dict (handles UUID objects)."""
+    return json.loads(json.dumps(data, default=str))
+
+
+class ParentDeletedError(Exception):
+    """Raised when a comment's parent task has been soft-deleted."""
+    pass
+
+
+# --- Rate Limiting Throttle Classes --- #
+
+class SyncPushThrottle(SimpleRateThrottle):
+    scope = 'sync_push'
+
+    def get_cache_key(self, request, view):
+        if request.user.is_authenticated:
+            return self.cache_format % {'scope': self.scope, 'ident': request.user.pk}
+        return self.get_ident(request)
+
+
+class SyncPullThrottle(SimpleRateThrottle):
+    scope = 'sync_pull'
+
+    def get_cache_key(self, request, view):
+        if request.user.is_authenticated:
+            return self.cache_format % {'scope': self.scope, 'ident': request.user.pk}
+        return self.get_ident(request)
+
+
+class ConflictResolutionThrottle(SimpleRateThrottle):
+    scope = 'conflict_resolution'
+
+    def get_cache_key(self, request, view):
+        if request.user.is_authenticated:
+            return self.cache_format % {'scope': self.scope, 'ident': request.user.pk}
+        return self.get_ident(request)
+
+
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+@throttle_classes([SyncPushThrottle])
 def sync_push(request):
     """
     Handle push synchronization from client to server.
@@ -243,17 +286,59 @@ def _update_task(data, user, device, client_vector_clock):
     )
 
     if has_conflict:
-        # Create conflict record
+        # Attempt auto-resolution before creating manual Conflict
+        server_data = _json_safe(TaskSerializer(task).data)
+        resolved_data, auto_resolved, unresolvable = auto_resolve_task_conflict(
+            data, server_data
+        )
+
+        if auto_resolved:
+            logger.info(f"Auto-resolved task conflict for {task_id}")
+            task.title = resolved_data.get('title', task.title)
+            task.description = resolved_data.get('description', task.description)
+            task.status = resolved_data.get('status', task.status)
+            task.priority = resolved_data.get('priority', task.priority)
+            task.due_date = _parse_timestamp(resolved_data.get('due_date')) if 'due_date' in resolved_data else task.due_date
+            task.assigned_to_id = resolved_data.get('assigned_to', task.assigned_to_id)
+            task.tags = resolved_data.get('tags', task.tags)
+            task.custom_fields = resolved_data.get('custom_fields', task.custom_fields)
+            task.position = resolved_data.get('position', task.position)
+            task.vector_clock = merge_vector_clocks(
+                data.get('vector_clock', {}), task.vector_clock
+            )
+            task.version = max(data.get('version', 1), task.version) + 1
+            task.last_modified_by = user
+            task.last_modified_device = device
+            task.save(recalculate_checksum=True)
+
+            Conflict.objects.create(
+                entity_type='task',
+                entity_id=task.id,
+                device=device,
+                user=user,
+                local_version=data,
+                server_version=server_data,
+                local_vector_clock=data.get('vector_clock', {}),
+                server_vector_clock=task.vector_clock,
+                conflict_reason=reason,
+                resolution_strategy='auto_resolved',
+                resolved_version=resolved_data,
+                resolved_by=user,
+                resolved_at=timezone.now()
+            )
+            return None  # No conflict to surface to client
+
+        # Cannot auto-resolve - create manual conflict
         conflict = Conflict.objects.create(
             entity_type='task',
             entity_id=task.id,
             device=device,
             user=user,
             local_version=data,
-            server_version=TaskSerializer(task).data,
+            server_version=server_data,
             local_vector_clock=data.get('vector_clock', {}),
             server_vector_clock=task.vector_clock,
-            conflict_reason=reason
+            conflict_reason=f"{reason}. Unresolvable fields: {', '.join(unresolvable)}"
         )
         return conflict
 
@@ -299,7 +384,7 @@ def _delete_task(task_id, data, user, device):
         deleted_by=user,
         deleted_from_device=device,
         vector_clock=data.get('vector_clock', {}),
-        entity_snapshot=TaskSerializer(task).data
+        entity_snapshot=_json_safe(TaskSerializer(task).data)
     )
 
     return None
@@ -336,6 +421,11 @@ def _process_comment_changes(changes, user, device, client_vector_clock):
                 _delete_comment(change_id, change_data, user, device)
                 processed.append(str(change_id))
 
+        except ParentDeletedError as e:
+            # Parent task was deleted - mark comment as processed so
+            # client removes it from sync queue (orphan cleanup)
+            logger.info(f"Orphaned comment {change_id}: {str(e)}")
+            processed.append(str(change_id))
         except Exception as e:
             logger.error(f"Error processing comment change {change_id}: {str(e)}")
             continue
@@ -345,6 +435,20 @@ def _process_comment_changes(changes, user, device, client_vector_clock):
 
 def _create_comment(data, user, device):
     """Create a new comment from sync data."""
+    # Check if parent task exists and isn't soft-deleted
+    task_id = data.get('task')
+    if task_id:
+        try:
+            task = Task.all_objects.get(id=task_id, organization=user.organization)
+            if task.deleted_at is not None:
+                raise ParentDeletedError(
+                    f"Parent task {task_id} has been deleted"
+                )
+        except Task.DoesNotExist:
+            raise ParentDeletedError(
+                f"Parent task {task_id} does not exist"
+            )
+
     comment = Comment(
         id=data['id'],
         task_id=data['task'],
@@ -376,6 +480,12 @@ def _update_comment(data, user, device, client_vector_clock):
         _create_comment(data, user, device)
         return None
 
+    # Check if parent task has been soft-deleted
+    if comment.task.deleted_at is not None:
+        raise ParentDeletedError(
+            f"Parent task {comment.task_id} has been deleted"
+        )
+
     # Check for conflicts
     has_conflict, reason = detect_conflict(
         {'vector_clock': data.get('vector_clock', {})},
@@ -384,16 +494,34 @@ def _update_comment(data, user, device, client_vector_clock):
     )
 
     if has_conflict:
+        server_data = _json_safe(CommentSerializer(comment).data)
+        resolved_data, auto_resolved, unresolvable = auto_resolve_comment_conflict(
+            data, server_data
+        )
+
+        if auto_resolved:
+            logger.info(f"Auto-resolved comment conflict for {comment_id}")
+            comment.content = resolved_data.get('content', comment.content)
+            comment.vector_clock = merge_vector_clocks(
+                data.get('vector_clock', {}), comment.vector_clock
+            )
+            comment.version = max(data.get('version', 1), comment.version) + 1
+            comment.last_modified_by = user
+            comment.last_modified_device = device
+            comment.is_edited = True
+            comment.save()
+            return None
+
         conflict = Conflict.objects.create(
             entity_type='comment',
             entity_id=comment.id,
             device=device,
             user=user,
             local_version=data,
-            server_version=CommentSerializer(comment).data,
+            server_version=server_data,
             local_vector_clock=data.get('vector_clock', {}),
             server_vector_clock=comment.vector_clock,
-            conflict_reason=reason
+            conflict_reason=f"{reason}. Unresolvable fields: {', '.join(unresolvable)}"
         )
         return conflict
 
@@ -422,7 +550,7 @@ def _delete_comment(comment_id, data, user, device):
             deleted_by=user,
             deleted_from_device=device,
             vector_clock=data.get('vector_clock', {}),
-            entity_snapshot=CommentSerializer(comment).data
+            entity_snapshot=_json_safe(CommentSerializer(comment).data)
         )
     except Comment.DoesNotExist:
         pass
@@ -430,6 +558,7 @@ def _delete_comment(comment_id, data, user, device):
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+@throttle_classes([SyncPullThrottle])
 def sync_pull(request):
     """
     Handle pull synchronization from server to client.
@@ -542,6 +671,7 @@ class ConflictViewSet(viewsets.ReadOnlyModelViewSet):
     """
     serializer_class = ConflictDetailSerializer
     permission_classes = [IsAuthenticated, IsOrganizationMember]
+    throttle_classes = [ConflictResolutionThrottle]
 
     def get_queryset(self):
         """Get unresolved conflicts for current user."""

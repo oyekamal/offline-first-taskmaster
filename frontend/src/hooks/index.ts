@@ -6,3 +6,4 @@ export * from './useTasks';
 export * from './useComments';
 export * from './useSync';
 export * from './useOnlineStatus';
+export * from './useStorageQuota';

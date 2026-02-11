@@ -261,6 +261,31 @@ Login → POST /api/auth/login/ {email, password, deviceFingerprint}
   → Initialize SyncManager → start periodic sync
 ```
 
+## Implementation Status (What's Built vs Designed-Only)
+
+See `doc/OFFLINE_FIRST_AUDIT.md` for full audit details.
+
+**Built and working:**
+- Offline CRUD (tasks + comments) with IndexedDB-first writes
+- Sync queue, periodic sync (30s), auto-sync on reconnect
+- Vector clock conflict detection (frontend + backend)
+- Manual conflict resolution UI (local/server/custom)
+- Delta sync with pagination, batch push
+- Tombstones + soft deletes, audit trail (TaskHistory)
+- JWT auth with auto-refresh, device tracking
+- PWA with service worker caching
+
+**Designed in docs but NOT implemented:**
+- Operational Transformation (text merge) — zero code
+- Auto-conflict resolution (higher-priority-wins, union merge, etc.) — zero code
+- WebSocket real-time updates — no Django Channels
+- Rate limiting on sync endpoints — no throttle classes
+- Attachments/file sync — no frontend model or upload code
+- End-to-end encryption — no Web Crypto API usage
+- Status transition validation — placeholder `pass` in serializer
+- Storage quota handling — no quota checks
+- Push notifications — SW handler exists but no backend sender
+
 ## Known Issues & Gotchas
 
 1. **API responses are paginated** — use `response.data.results`, not `response.data`

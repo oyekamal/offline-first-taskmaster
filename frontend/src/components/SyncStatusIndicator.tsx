@@ -6,7 +6,7 @@ import { useSync } from '../hooks';
 import { formatRelativeTime } from '../utils/dateFormat';
 
 export function SyncStatusIndicator() {
-  const { status, sync, isSyncing, pendingCount, isOnline, lastSyncAt } = useSync();
+  const { status, sync, isSyncing, pendingCount, isOnline, lastSyncAt, permissionErrorCount, clearPermissionErrors } = useSync();
 
   const getStatusColor = () => {
     if (!isOnline) return 'text-gray-400';
@@ -68,6 +68,21 @@ export function SyncStatusIndicator() {
       {status.conflict_count > 0 && (
         <span className="text-xs text-red-600 font-medium">
           {status.conflict_count} conflict{status.conflict_count > 1 ? 's' : ''}
+        </span>
+      )}
+
+      {permissionErrorCount > 0 && (
+        <span className="flex items-center gap-1">
+          <span className="text-xs text-orange-600 font-medium">
+            {permissionErrorCount} denied
+          </span>
+          <button
+            onClick={() => clearPermissionErrors()}
+            className="text-xs text-orange-500 hover:text-orange-700 underline"
+            title="Dismiss permission errors and stop retrying"
+          >
+            Dismiss
+          </button>
         </span>
       )}
     </div>

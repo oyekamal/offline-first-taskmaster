@@ -118,6 +118,7 @@ class Conflict(models.Model):
         ('auto_merge', 'Auto Merge'),
         ('local_wins', 'Local Wins'),
         ('server_wins', 'Server Wins'),
+        ('auto_resolved', 'Auto Resolved'),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

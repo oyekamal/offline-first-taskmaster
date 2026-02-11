@@ -140,6 +140,12 @@ REST_FRAMEWORK = {
         'rest_framework.parsers.JSONParser',
     ),
     'EXCEPTION_HANDLER': 'core.exceptions.custom_exception_handler',
+    'DEFAULT_THROTTLE_RATES': {
+        'sync_push': '60/min',
+        'sync_pull': '120/min',
+        'conflict_resolution': '30/min',
+        'login': '5/min',
+    },
 }
 
 # JWT Configuration

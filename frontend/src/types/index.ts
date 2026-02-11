@@ -83,7 +83,7 @@ export type SyncEntityType = 'task' | 'comment';
 /**
  * Sync status for individual items
  */
-export type SyncStatus = 'pending' | 'syncing' | 'synced' | 'conflict' | 'error';
+export type SyncStatus = 'pending' | 'syncing' | 'synced' | 'conflict' | 'error' | 'permission_denied';
 
 /**
  * Sync queue entry for offline operations
@@ -168,6 +168,7 @@ export interface SyncStatusInfo {
   pending_count: number;
   conflict_count: number;
   error_count: number;
+  permission_error_count: number;
   last_sync_at: string | null;
   is_online: boolean;
 }
